@@ -296,25 +296,20 @@ impl Future for Acquire<'_> {
 
 /// Returns `true` if successfully acquired the semaphore; `false` otherwise.
 fn acquired_or_enqueue(
-    semaphore: &Semaphore,
+    sem: &Semaphore,
     needed: usize,
     idx: &mut Option<usize>,
     waker: Option<&Waker>,
     enqueue_last: bool,
 ) -> bool {
-    let mut acquired = 0;
-    let mut current = semaphore.permits.load(Ordering::Acquire);
+    let mut current = sem.permits.load(Ordering::Acquire);
     let mut lock = None;
 
-    let mut waiters = loop {
-        let mut remaining = 0;
-        let total = current.checked_add(acquired).expect("permits overflow");
-        let (next, acq) = if total >= needed {
-            let next = current - (needed - acquired);
-            (next, needed - acquired)
+    loop {
+        let (remaining, next) = if current >= needed {
+            (0, current - needed)
         } else {
-            remaining = (needed - acquired) - current;
-            (0, current)
+            (needed - current, 0)
         };
 
         if remaining > 0 && lock.is_none() {
@@ -325,39 +320,46 @@ fn acquired_or_enqueue(
             // counter. Otherwise, if we subtract the permits and then
             // acquire the lock, we might miss additional permits being
             // added while waiting for the lock.
-            lock = Some(semaphore.waiters.lock());
+            lock = Some(sem.waiters.lock());
         }
 
-        match semaphore
-            .permits
-            .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+        if let Err(actual) =
+            sem.permits
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
         {
-            Ok(_) => {
-                acquired += acq;
-                if remaining == 0 {
-                    return true;
-                }
-                // SAFETY: remaining > 0, lock must be Some
-                break lock.unwrap();
-            }
-            Err(actual) => current = actual,
+            // other thread changed the permits; retry
+            current = actual;
+            continue;
         }
-    };
 
-    if enqueue_last {
-        waiters.register_waiter_to_tail(idx, || {
-            Some(WaitNode {
-                permits: needed - acquired,
-                waker: waker.cloned(),
-            })
+        // all needed permits were acquired
+        if remaining == 0 {
+            return true;
+        }
+
+        // all available permits were acquired, but more are needed;
+        // enqueue a waiter with the remaining needed permits
+
+        let mut waiters = lock.take().unwrap_or_else(|| {
+            unreachable!("lock must be acquired when remaining {remaining} > 0");
         });
-    } else {
-        waiters.register_waiter_to_head(idx, || {
-            Some(WaitNode {
-                permits: needed - acquired,
-                waker: waker.cloned(),
-            })
-        });
+
+        if enqueue_last {
+            waiters.register_waiter_to_tail(idx, || {
+                Some(WaitNode {
+                    permits: remaining,
+                    waker: waker.cloned(),
+                })
+            });
+        } else {
+            waiters.register_waiter_to_head(idx, || {
+                Some(WaitNode {
+                    permits: remaining,
+                    waker: waker.cloned(),
+                })
+            });
+        }
+
+        return false;
     }
-    false
 }
